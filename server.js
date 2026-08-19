@@ -1,11 +1,16 @@
-// mobile-ai-proto — phone-driven shared browser + claude agent.
+// mobile-ai-proto bridge — the agent's server side.
 //
-// One real Chrome (persistent profile = your logins) lives on this machine.
-// The phone gets a live screencast of it and can tap/scroll/type.
-// Chat messages run `claude -p` in agent/, where the agent drives the SAME
-// Chrome via tools/browse.mjs (CDP on 127.0.0.1:9223).
+// The BROWSER lives on the phone (app/ — a WebView inside the Expo app, with
+// the user's own cookies). The phone app connects OUT to this bridge over WS.
+// Chat messages run `claude -p` in agent/; the agent's tools/browse.mjs POSTs
+// commands to /cmd here, which relays them to the phone's WebView and returns
+// the result.
 //
-// Env knobs: APP_PORT (8788), HEADLESS=1, AGENT_MODEL (sonnet), CDP_PORT (9223)
+//   phone app (WebView + chat) ──WS──▶ this bridge ──spawn──▶ claude -p
+//                    ▲                    │ /cmd  ◀── tools/browse.mjs ┘
+//                    └──── cmd/result ────┘
+//
+// Env knobs: APP_PORT (8788), AGENT_MODEL (sonnet)
 
 import http from "node:http";
 import fs from "node:fs";
@@ -14,14 +19,10 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
-import { chromium } from "playwright-core";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.APP_PORT || 8788);
-const CDP_PORT = Number(process.env.CDP_PORT || 9223);
-const HEADLESS = process.env.HEADLESS === "1";
 const AGENT_MODEL = process.env.AGENT_MODEL || "sonnet";
-const VIEW = { width: 412, height: 840 };
 
 // ---- token (persisted; every request must carry ?t=<token>) ----
 const TOKEN_FILE = path.join(HERE, ".token");
@@ -30,45 +31,21 @@ try { TOKEN = fs.readFileSync(TOKEN_FILE, "utf8").trim(); } catch {}
 if (!TOKEN) { TOKEN = crypto.randomBytes(12).toString("hex"); fs.writeFileSync(TOKEN_FILE, TOKEN); }
 const okToken = (url) => new URL(url, "http://x").searchParams.get("t") === TOKEN;
 
-// ---- browser ----
-let context, page, cdp;
-const clients = new Set();
-const send = (obj) => { const s = JSON.stringify(obj); for (const ws of clients) if (ws.readyState === 1) ws.send(s); };
+// ---- phone device link ----
+let device = null;
+const pending = new Map(); // id -> {resolve, reject, timer}
 
-async function attach(p) {
-  page = p;
-  try { if (cdp) await cdp.send("Page.stopScreencast").catch(() => {}); } catch {}
-  cdp = await context.newCDPSession(page);
-  cdp.on("Page.screencastFrame", (ev) => {
-    send({ type: "frame", data: ev.data });
-    cdp.send("Page.screencastFrameAck", { sessionId: ev.sessionId }).catch(() => {});
+function devCmd(cmd, args, timeoutMs = 25_000) {
+  if (!device || device.readyState !== 1) return Promise.reject(new Error("phone app not connected — open the app on the phone"));
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error("phone timed out")); }, timeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    device.send(JSON.stringify({ type: "cmd", id, cmd, args }));
   });
-  await cdp.send("Page.startScreencast", { format: "jpeg", quality: 60, maxWidth: VIEW.width * 2, maxHeight: VIEW.height * 2 }).catch(() => {});
-  page.on("framenavigated", (f) => { if (f === page.mainFrame()) send({ type: "url", url: page.url() }); });
-  page.on("close", () => {
-    const pages = context.pages().filter((x) => x !== page);
-    if (pages.length) attach(pages[pages.length - 1]).catch(() => {});
-  });
-  send({ type: "url", url: page.url() });
 }
 
-async function startBrowser() {
-  context = await chromium.launchPersistentContext(path.join(HERE, ".chrome-profile"), {
-    channel: "chrome",
-    headless: HEADLESS,
-    viewport: VIEW,
-    deviceScaleFactor: 2,
-    isMobile: true,
-    hasTouch: true,
-    args: [`--remote-debugging-port=${CDP_PORT}`, "--disable-blink-features=AutomationControlled", "--hide-crash-restore-bubble"],
-  });
-  context.on("page", (p) => attach(p).catch((e) => console.error("attach:", e.message)));
-  const p = context.pages()[0] || (await context.newPage());
-  await attach(p);
-  if (p.url() === "about:blank") await p.goto("https://www.google.com").catch(() => {});
-}
-
-// ---- agent (claude -p in agent/, browser tool via CDP) ----
+// ---- agent (claude -p in agent/) ----
 let agentBusy = false;
 let hasSession = fs.existsSync(path.join(HERE, "agent", ".started"));
 
@@ -77,7 +54,7 @@ function scrubbedEnv() {
   for (const k of Object.keys(env)) {
     if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "ANTHROPIC_API_KEY") delete env[k];
   }
-  env.CDP_PORT = String(CDP_PORT);
+  env.APP_PORT = String(PORT);
   return env;
 }
 
@@ -106,68 +83,54 @@ async function chat(msg) {
 }
 
 // ---- http ----
+const readBody = (req) => new Promise((res) => { let b = ""; req.on("data", (d) => (b += d)); req.on("end", () => res(b)); });
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
-  if (!okToken(req.url)) { res.writeHead(403); return res.end("bad token"); }
-  if (u.pathname === "/" || u.pathname === "/index.html") {
-    res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
-    return res.end(fs.readFileSync(path.join(HERE, "index.html")));
+  const json = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+  if (!okToken(req.url)) return json(403, { error: "bad token" });
+
+  if (u.pathname === "/" || u.pathname === "/status") {
+    return json(200, { ok: true, phone: !!(device && device.readyState === 1), agentBusy });
+  }
+  if (u.pathname === "/cmd" && req.method === "POST") {
+    try {
+      const { cmd, args } = JSON.parse(await readBody(req) || "{}");
+      const result = await devCmd(String(cmd), args || {});
+      return json(200, { ok: true, result });
+    } catch (e) { return json(200, { ok: false, error: e.message }); }
   }
   if (u.pathname === "/chat" && req.method === "POST") {
-    let body = "";
-    req.on("data", (d) => (body += d));
-    req.on("end", async () => {
-      if (agentBusy) { res.writeHead(429, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ reply: "agent is busy with the previous message — wait for it to finish" })); }
-      agentBusy = true;
-      send({ type: "agent", state: "working" });
-      try {
-        const { msg } = JSON.parse(body || "{}");
-        const reply = await chat(String(msg || "").slice(0, 8000));
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ reply }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ reply: "server error: " + e.message }));
-      } finally {
-        agentBusy = false;
-        send({ type: "agent", state: "idle" });
-      }
-    });
-    return;
+    const body = await readBody(req);
+    if (agentBusy) return json(429, { reply: "agent is busy with the previous message — wait for it to finish" });
+    agentBusy = true;
+    try {
+      const { msg } = JSON.parse(body || "{}");
+      return json(200, { reply: await chat(String(msg || "").slice(0, 8000)) });
+    } catch (e) { return json(500, { reply: "server error: " + e.message }); }
+    finally { agentBusy = false; }
   }
-  res.writeHead(404); res.end("nope");
+  json(404, { error: "nope" });
 });
 
-// ---- ws: frames out, input in ----
+// ---- ws: the phone app ----
 const wss = new WebSocketServer({ server, path: "/ws" });
 wss.on("connection", (ws, req) => {
   if (!okToken(req.url)) return ws.close();
-  clients.add(ws);
-  ws.on("close", () => clients.delete(ws));
-  if (page) {
-    ws.send(JSON.stringify({ type: "url", url: page.url() }));
-    // screencast only emits on repaint — seed late joiners with a fresh shot
-    page.screenshot({ type: "jpeg", quality: 60 })
-      .then((buf) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "frame", data: buf.toString("base64") })); })
-      .catch(() => {});
-  }
-  ws.on("message", async (raw) => {
-    if (!page) return;
+  device = ws; // last phone wins — it's a one-user prototype
+  console.log("phone connected");
+  ws.on("close", () => { if (device === ws) device = null; console.log("phone disconnected"); });
+  ws.on("message", (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
-    try {
-      const px = (n, d) => Math.max(0, Math.min(d, Math.round(n * d)));
-      if (m.type === "tap") await page.mouse.click(px(m.x, VIEW.width), px(m.y, VIEW.height));
-      else if (m.type === "scroll") { await page.mouse.move(px(m.x ?? 0.5, VIEW.width), px(m.y ?? 0.5, VIEW.height)); await page.mouse.wheel(0, m.dy | 0); }
-      else if (m.type === "text") await page.keyboard.insertText(String(m.text || ""));
-      else if (m.type === "key") await page.keyboard.press(String(m.key));
-      else if (m.type === "nav") { let url = String(m.url || "").trim(); if (url && !/^https?:\/\//.test(url)) url = url.includes(".") && !url.includes(" ") ? "https://" + url : "https://www.google.com/search?q=" + encodeURIComponent(url); if (url) await page.goto(url).catch(() => {}); }
-      else if (m.type === "back") await page.goBack().catch(() => {});
-    } catch (e) { /* input races page lifecycle; drop it */ }
+    if (m.type === "result" && pending.has(m.id)) {
+      const p = pending.get(m.id);
+      pending.delete(m.id);
+      clearTimeout(p.timer);
+      m.ok ? p.resolve(m.r) : p.reject(new Error(m.err || "command failed on phone"));
+    }
   });
 });
 
-startBrowser().then(() => {
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`mobile-ai-proto on http://127.0.0.1:${PORT}/?t=${TOKEN}`);
-  });
-}).catch((e) => { console.error("browser failed to start:", e); process.exit(1); });
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`bridge on http://0.0.0.0:${PORT}  token=${TOKEN}`);
+});

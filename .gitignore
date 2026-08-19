@@ -3,3 +3,5 @@ node_modules/
 .token
 agent/.started
 agent/.claude/
+app/.expo/
+app/config.js

@@ -1,48 +1,58 @@
 # mobile-ai-proto
 
-A dead-simple prototype: a **shared browser** you and an AI agent both drive,
-from your phone.
-
-One real Chrome (persistent profile — your logins live in it) runs on the
-server. Your phone gets a live view of it: tap, scroll, type, log into Gmail.
-A chat box talks to a `claude -p` agent (the claude-p-agent pattern) whose
-tool drives the **same** Chrome — so "mark all my junk mail as read" runs
-inside your authenticated session while you watch.
+A mobile app with a **built-in browser** that both you and an AI agent can
+drive. Your logins (Gmail etc.) live in the phone's WebView — the agent lives
+on a server and sends browser commands to the phone.
 
 ```
-phone (web app, add-to-home-screen)
- ├─ live screencast of Chrome  ── taps/scroll/typing ──▶ ┐
- └─ chat ──▶ /chat ──▶ claude -p (agent/CLAUDE.md)       ├──▶ ONE Chrome
-                          └─ tools/browse.mjs ── CDP ──▶ ┘   (.chrome-profile)
+PHONE (Expo app)                          SERVER (bridge)
+ ├─ WebView (your cookies)  ◀── cmds ──── server.js ◀── tools/browse.mjs
+ └─ chat ─────────── /chat ─────────────▶ claude -p (agent/CLAUDE.md)
+        (phone connects OUT over WS — no inbound to the phone needed)
 ```
+
+Say "mark all my junk mail as read" in the chat: the server runs a
+`claude -p` agent whose `browse.mjs` tool relays read/click/type commands
+through the bridge into the WebView on your phone, inside your own
+authenticated session, while you watch.
 
 ## Run
 
+Server (Mac or any box with the `claude` CLI logged in):
+
 ```
 npm install
-node server.js        # prints http://127.0.0.1:8788/?t=<token>
+node server.js          # bridge on :8788, token in .token
 ```
 
-Open `http://<server-lan-ip>:8788/?t=<token>` on your phone (same wifi /
-tailscale) and add to home screen. Needs `claude` CLI logged in (subscription)
-and Google Chrome installed.
+Phone (prototype path — Expo Go):
 
-- **Top**: URL bar + live browser. Tap = click, drag = scroll, the
-  "type into the page…" row sends keystrokes (⏎ submits). Log into Gmail here
-  by hand once — the profile remembers.
-- **Bottom**: chat with the agent. It uses `tools/browse.mjs`
-  (read / ui / tapi / tap / type / press / scroll / shot) against the same
-  browser, and you watch it work live.
+1. Install **Expo Go** from the App Store.
+2. On the server box: `cd app && npm install && npx expo start`
+3. Scan the QR with the phone camera → app opens in Expo Go.
+4. Copy `app/config.example.js` → `app/config.js` (gitignored) and set
+   `SERVER` (LAN IP or tailscale name of the bridge) + `TOKEN` (the `.token`
+   value server.js prints).
 
-Env knobs: `APP_PORT` (8788), `HEADLESS=1` (Linux server w/ xvfb; default is
-headful — Google logins are friendlier to a headful Chrome), `AGENT_MODEL`
-(sonnet), `CDP_PORT` (9223).
+Log into Gmail once by hand in the app's browser — cookies persist on the
+phone. Then chat.
+
+## Pieces
+
+- `server.js` — bridge: WS link to the phone, `/cmd` relay, `/chat` → `claude -p`.
+- `app/` — Expo app: WebView + URL bar + chat drawer. `inject.js` is the
+  in-page command runner (read / ui / tapi / tap / type / press / scroll).
+- `tools/browse.mjs` — the agent's CLI; POSTs commands to the bridge.
+- `agent/CLAUDE.md` — the agent persona (claude-p-agent pattern).
 
 ## Notes / limits (it's a prototype)
 
-- Token-in-URL auth, plain HTTP — keep it on LAN or tailscale.
-- One page at a time (popups auto-followed), one agent turn at a time.
-- Google can be suspicious of automated browsers at login; if it balks, log in
-  with `HEADLESS` off (default) — sessions persist in `.chrome-profile/`.
-- The agent runs `--dangerously-skip-permissions` inside `agent/` — it's meant
-  for a box you own.
+- Token auth over plain HTTP/WS — keep it on LAN or tailscale.
+- No screenshots: the agent works from page text + element lists. Canvas-heavy
+  UIs are hard for it; Gmail's mobile web works.
+- Google sometimes refuses login inside WebViews; the app spoofs a Safari UA
+  which usually satisfies it.
+- One phone, one agent turn at a time. `--dangerously-skip-permissions` in
+  `agent/` — for a box you own.
+- Test rig: `scratchpad fake-device` pattern — a headless Chrome pretending to
+  be the phone lets you test the whole chain without a device.
