@@ -5,3 +5,5 @@ agent/.started
 agent/.claude/
 app/.expo/
 app/config.js
+web/agent/.started
+web/agent/.claude/
