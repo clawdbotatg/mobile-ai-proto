@@ -1,0 +1,13 @@
+{
+  "name": "mobile-ai-proto",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.50.0",
+    "ws": "^8.18.0"
+  }
+}
